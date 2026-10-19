@@ -1,0 +1,31 @@
+# Python virtual env and bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local logs and session data
+logs/
+*.log
+*.bcut.json
+*.bcut.json.tmp
+
+# Generated video and AI training output
+*_clips/
+*.part.mp4
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.m4v
+clips_manifest_*.json
+clips_manifest_*.csv
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
