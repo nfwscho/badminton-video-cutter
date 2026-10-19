@@ -7,6 +7,7 @@ __pycache__/
 .mypy_cache/
 
 # Local logs and session data
+preview_cache/
 logs/
 *.log
 *.bcut.json

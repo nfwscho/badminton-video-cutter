@@ -1,22 +1,17 @@
-# RUN
-cd D:\stockproj\badminton-video-cutter
-$env:QT_FFMPEG_DECODING_HW_DEVICE_TYPES=","
-.\.venv\Scripts\python.exe .\badminton_video_cutter.py
-
-# Badminton Video Cutter V1.0 — Windows 설치 및 Git 사용 안내서
+# Badminton Video Cutter V1.2 — Windows 설치 및 Git 사용 안내서
 
 > **대상 환경:** Windows 10/11, PowerShell, Python 3.12, PySide6, FFmpeg/FFprobe, Git  
 > **프로젝트 경로:** `D:\stockproj\badminton-video-cutter`  
 > **실행 소스:** `badminton_video_cutter.py` (Python 파일은 **1개**)  
 > **Docker:** 사용하지 않음
 
-이 문서는 프로젝트 폴더 생성부터 설치, 실행, 동영상 컷 저장, Git 첫 커밋 및 GitHub 연결까지 **처음부터 차례로 따라 할 수 있도록** 정리한 가이드입니다.
+이 문서는 프로젝트 폴더 생성부터 설치, 실행, 동영상 컷 저장, Git 첫 커밋 및 GitHub 연결까지 **처음부터 차례로 따라 할 수 있도록** 정리한 가이드입니다. 이미 V1.1을 설치한 경우에는 **14절의 V1.2 업데이트 절차**로 바로 이동하세요.
 
 ---
 
 ## 1. 설치 파일 다운로드 및 프로젝트 폴더 만들기
 
-1. `badminton-video-cutter-v1.zip`을 다운로드합니다.
+1. `badminton-video-cutter-v1.2.zip`을 다운로드합니다.
 2. Windows의 **PowerShell**을 실행합니다.
 3. 다음 명령을 실행해 작업 폴더를 만듭니다.
 
@@ -29,7 +24,7 @@ ZIP 파일을 기본 **다운로드** 폴더에 저장했다면 다음 명령으
 
 ```powershell
 Expand-Archive `
-  -LiteralPath "$env:USERPROFILE\Downloads\badminton-video-cutter-v1.zip" `
+  -LiteralPath "$env:USERPROFILE\Downloads\badminton-video-cutter-v1.2.zip" `
   -DestinationPath "D:\stockproj\badminton-video-cutter" `
   -Force
 ```
@@ -120,6 +115,23 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 > V1은 수동 컷 편집 프로그램이므로 **OpenCV, MediaPipe, AI 모델을 설치할 필요가 없습니다.**
 
+### 4-1. V1.2 AV1 원본 직접 재생: VLC 설치 (강력 권장)
+
+전체 AV1 영상을 변환하지 않으려면 다음 명령을 **한 번만** 실행하세요. VLC는 Python 모듈이 아니라 별도로 설치하는 **64비트 재생 엔진**입니다.
+
+```powershell
+winget install --id VideoLAN.VLC -e
+.\.venv\Scripts\python.exe -m pip install python-vlc
+```
+
+VLC가 이미 설치되었다면 첫 명령은 생략할 수 있습니다. VLC 설치가 끝나면 PowerShell을 새로 열고, 필요하면 아래 명령으로 설치 경로를 확인합니다.
+
+```powershell
+Test-Path "C:\Program Files\VideoLAN\VLC\libvlc.dll"
+```
+
+해당 경로가 `False`라면 VLC가 다른 경로에 설치되었는지 확인하세요. 표준 경로 외에는 14절의 `PYTHON_VLC_LIB_PATH` 안내를 참고하세요. VLC 없이도 기존 H.264 캐시 재생/수동 변환 방식은 계속 사용 가능합니다.
+
 ## 5. FFmpeg 및 FFprobe 설치
 
 FFmpeg는 컷 저장, FFprobe는 FPS·해상도 등 영상 정보 확인에 사용됩니다.
@@ -154,7 +166,7 @@ Set-Location "D:\stockproj\badminton-video-cutter"
 
 ## 7. 첫 번째 동영상 컷 만들기
 
-1. **동영상 열기** 버튼으로 MP4 등 원본 동영상을 불러옵니다.
+1. **동영상 열기** 버튼으로 MP4 등 원본 동영상을 불러옵니다. VLC가 설치된 경우 AV1도 사전 변환 없이 직접 재생됩니다. (VLC 미설치 시 기존 캐시를 쓰거나 수동 변환 선택 가능)
 2. 재생/일시정지, 타임라인 슬라이더 또는 방향키로 원하는 부분을 찾습니다.
 3. 컷 시작 위치에서 **IN** 버튼 또는 `I` 키를 누릅니다.
 4. 컷 종료 위치에서 **OUT** 버튼 또는 `O` 키를 누릅니다.
@@ -291,7 +303,7 @@ GitHub 원격 연결 없이 **로컬 Git만 사용해도 정상적으로 버전 
 | `No module named 'PySide6'` | `.\.venv\Scripts\python.exe`가 아닌 시스템 Python을 사용했을 수 있음. 가상환경 Python으로 PySide6 재설치 |
 | `Activate.ps1` 실행 정책 오류 | 활성화 생략하고 `.\.venv\Scripts\python.exe` 직접 사용 |
 | `ffmpeg`/`ffprobe`를 찾을 수 없음 | 새 PowerShell에서 확인, `PATH` 확인 또는 EXE 두 개를 소스 파일과 동일한 폴더에 배치 |
-| 영상이 검게 보이거나 재생 불가 | Windows/Qt 멀티미디어 코덱 호환성 확인. H.264/AAC MP4로 테스트 |
+| 영상이 검게 보이거나 재생 불가 | v1.2.0과 `VLC 직접 재생 준비 완료` 로그 확인. VLC 64비트 + `python-vlc` 설치 권장. 실패 시 호환 미리보기 버튼으로 수동 변환 가능 |
 | 방향키 프레임 이동 불가 | `ffprobe` 탐색 및 영상 FPS 조회 상태 확인 |
 | `git commit`에서 작성자 정보 오류 | `git config user.name`, `git config user.email` 설정 후 재시도 |
 | `git push`에서 인증/권한 오류 | 원격 URL, GitHub 저장소 권한 및 인증 상태 확인 |
@@ -310,6 +322,8 @@ D:\stockproj\badminton-video-cutter\logs\badminton_video_cutter.log
 | 기능 | 현재 상태 |
 |---|---|
 | 동영상 불러오기·재생·정지·배속 | 지원 |
+| VLC 원본 직접 재생 (전체 인코딩 없음) | **v1.2 추가 / VLC 설치 필요** |
+| AV1 → H.264 호환 미리보기 변환·캐시·취소 | **v1.1 유지 / v1.2에서는 수동 대체 기능** |
 | IN/OUT 구간 지정 및 구간 반복 재생 | 지원 |
 | FPS 기반 전후 프레임 이동(근사) | 지원 |
 | 다중 컷 추가·삭제·편집 | 지원 |
@@ -335,3 +349,130 @@ D:\stockproj\badminton-video-cutter\logs\badminton_video_cutter.log
 - [ ] 샘플 동영상에서 컷을 하나 만들고 MP4 저장을 확인했다.
 - [ ] `git log --oneline -5`에서 첫 커밋이 확인된다.
 - [ ] (선택) GitHub에 최초 `git push`를 완료했다.
+
+
+## 13. v1.0 → v1.1 업데이트 (과거 버전 참고 기록)
+
+> 이 절은 이전 v1.1 버전의 설치·변환 방식을 기록한 **이력**입니다. 현재 프로그램 설치/업데이트는 아래 **14절의 V1.2 지침**을 이용하세요.
+
+Windows에서 다음과 같은 오류와 함께 영상이 검게 보일 때 적용하는 버전입니다.
+
+```text
+[av1] Your platform doesn't support hardware accelerated AV1 decoding.
+[av1] Failed to get pixel format.
+[av1] Get current frame error
+```
+
+**기존 프로젝트 및 로그 보존**: `.bcut.json` 프로젝트·`logs/`·`.venv/`·내보낸 MP4·원본 영상은 삭제하지 않습니다. Git 커밋이 이미 존재한다면 Git 저장소를 재초기화하지 않습니다.
+
+1. 사용 중인 프로그램을 종료합니다.
+2. 제공된 `badminton-video-cutter-v1.1.zip`을 다운로드 폴더에 저장합니다.
+3. PowerShell에서 프로젝트로 이동하여 소스 변경 내역을 먼저 확인합니다.
+
+```powershell
+cd D:\stockproj\badminton-video-cutter
+git status --short
+```
+
+4. **기존 Python 파일을 직접 수정해 둔 경우** Git 커밋 또는 복사본으로 먼저 백업합니다. 미수정 상태라면 바로 아래를 실행합니다.
+
+```powershell
+Expand-Archive -LiteralPath "$env:USERPROFILE\Downloads\badminton-video-cutter-v1.1.zip" -DestinationPath "D:\stockproj\badminton-video-cutter" -Force
+```
+
+5. 별도 패키지 추가 설치 없이 기존 `.venv`로 실행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe .\badminton_video_cutter.py
+```
+
+6. AV1 영상을 열면 **자동 호환 미리보기 변환**이 시작됩니다. 40분 영상은 PC 성능/코덱에 따라 오래 걸릴 수 있습니다. GUI 오른쪽에 진행률과 취소 버튼이 있습니다.
+7. 변환된 미리보기는 프로젝트 폴더 아래 `preview_cache/`에 저장되고, **일괄 컷 내보내기는 원본을 사용**합니다.
+8. 재생·컷 추가·내보내기를 확인한 뒤 Git 변경사항을 커밋합니다.
+
+```powershell
+git status --short
+git diff --stat
+git add badminton_video_cutter.py README.md INSTALL.md .gitignore
+git commit -m "Fix AV1 playback using H264 proxy preview v1.1"
+```
+
+**주의:** 변환 완료 전 창을 강제로 종료하지 마세요. 취소 버튼으로 작업을 정리한 후 종료합니다. 필요한 디스크 공간이 부족하면 미리보기가 실패할 수 있습니다. 재생용 캐시를 지워도 원본/컷 결과는 유지됩니다.
+
+
+## 14. V1.1 → V1.2 업데이트: AV1 즉시 재생 (필독)
+
+40분 AV1 영상의 H.264 미리보기 변환에 20분 넘게 걸리는 문제를 해결하기 위해 **VLC 직접 재생**을 추가했습니다.
+
+### 14-1. 기존 프로젝트 보호
+
+- 기존 `badminton_video_cutter.py`는 업데이트 전 Git 커밋 또는 별도 백업을 남깁니다.
+- `.venv/`, `logs/`, `preview_cache/`, `*_clips/`, 기존 `.bcut.json` 프로젝트, 사용자 동영상은 **삭제하지 않습니다**.
+- Git 저장소가 이미 있으므로 `git init`을 다시 실행하지 않습니다.
+
+```powershell
+cd D:\stockproj\badminton-video-cutter
+git status --short
+```
+
+### 14-2. VLC 설치 (한 번만 수행)
+
+```powershell
+winget install --id VideoLAN.VLC -e
+cd D:\stockproj\badminton-video-cutter
+.\.venv\Scripts\python.exe -m pip install python-vlc
+```
+
+VLC 공식 사이트: https://www.videolan.org/vlc/download-windows.html
+
+VLC 64비트 기본 경로: `C:\Program Files\VideoLAN\VLC\libvlc.dll`.
+
+```powershell
+Test-Path "C:\Program Files\VideoLAN\VLC\libvlc.dll"
+```
+
+`False`면 설치 위치/비트수를 확인합니다. 비표준 경로에는 다음 환경변수 사용 (경로는 실제 설치 경로로 변경):
+
+```powershell
+$env:PYTHON_VLC_LIB_PATH = "D:\VLC\libvlc.dll"
+$env:VLC_PLUGIN_PATH = "D:\VLC\plugins"
+```
+
+### 14-3. V1.2 파일 적용 및 실행
+
+다운로드한 `badminton-video-cutter-v1.2.zip`을 **기존 폴더에 덮어쓰기**합니다.
+
+```powershell
+Expand-Archive -LiteralPath "$env:USERPROFILE\Downloads\badminton-video-cutter-v1.2.zip" -DestinationPath "D:\stockproj\badminton-video-cutter" -Force
+cd D:\stockproj\badminton-video-cutter
+.\.venv\Scripts\python.exe .\badminton_video_cutter.py
+```
+
+로그에서 아래 메시지를 확인합니다.
+
+```text
+프로그램 시작: v1.2.0
+VLC 직접 재생 준비 완료: ...
+재생 엔진: VLC 원본 직접 재생 (전체 변환 생략)
+동영상 열기: ... 코덱=av1
+VLC 원본 직접 재생 준비: ... / 전체 미리보기 변환 생략
+```
+
+**영상 열기 후 원본 재생이 바로 준비되는지** 확인합니다. 40분짜리 전체 영상을 H.264로 변환하지 않아야 정상입니다. VLC에서 첫 프레임/임의 탐색이 일시적으로 늦을 수는 있습니다.
+
+### 14-4. 오류 시 확인
+
+- `VLC 직접 재생 비활성` 로그: `python-vlc` 설치 여부 및 `libvlc.dll`의 64비트 설치 경로를 확인합니다.
+- 원본이 검게 보일 때: 일반 VLC 앱에서 같은 MP4를 재생해 확인하고, 앱 로그와 VLC 버전을 함께 기록합니다.
+- VLC가 없더라도 **기존 `preview_cache/`가 있다면** 앱에서 캐시를 사용합니다. 없을 때는 전체 변환이 자동 시작되지 않고, 호환 미리보기 버튼을 수동으로 눌러야 합니다.
+- VLC에서도 CPU AV1 디코딩 성능이 부족하면 끊길 수 있습니다. 미리보기 변환은 원본 컷 내보내기 품질과 무관합니다.
+
+### 14-5. V1.2 변경 사항 Git 기록
+
+```powershell
+cd D:\stockproj\badminton-video-cutter
+git diff --stat
+git add badminton_video_cutter.py README.md INSTALL.md .gitignore
+git commit -m "Add direct VLC AV1 playback without full transcode v1.2"
+git log --oneline -5
+```

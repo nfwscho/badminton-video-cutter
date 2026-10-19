@@ -44,8 +44,19 @@
 # 30. Qt 하드웨어 디코딩 환경 설정은 PySide6 import 이전에 적용.
 # 31. 미리보기 생성 중 원본 변경·프로젝트 로드·내보내기·종료를 제한,
 #     취소 후 스레드/임시파일을 정리. 기존 기능/단축키/로그를 유지.
+# 32. V1.2: VLC(libVLC)가 있을 경우 원본 AV1/H.264 등을 전체 변환 없이
+#     앱 안에서 직접 재생. Qt 영상 표시 영역을 동일 위치의 native HWND로 연결.
+# 33. VLC 재생에서도 재생/정지, 시간 이동, 배속, 프레임 근사 이동, 반복,
+#     IN/OUT, 컷 선택/저장, 프로젝트, 데이터셋, 기존 UI/작업로그 유지.
+# 34. Python-VLC와 VLC 64비트 설치 여부를 검사; 오류 시 Qt 플레이어로
+#     안전하게 전환, AV1은 전체 변환을 자동 실행하지 않고 선택하도록 함.
+# 35. 기존 preview_cache가 있으면 VLC 없이도 즉시 재생 가능. 미리보기 변환
+#     버튼·GPU/CPU 자동 재시도·취소·진행률은 비상 대체 기능으로 보존.
+# 36. VLC 초기화/실패/직접 재생 상태를 기존 UI/회전 로그에 기록.
+# 37. 항상 원본 파일/시간축 기준으로 컷 저장, VLC/프록시는 재생 전용.
 #
-# 필요 패키지: pip install PySide6
+# 권장 패키지: pip install PySide6 python-vlc (VLC 64bit 별도 설치)
+# 기본 패키지: pip install PySide6
 # 필요 외부 실행파일: ffmpeg, ffprobe (PATH 또는 이 파일과 같은 폴더)
 # 실행: python badminton_video_cutter.py
 # =============================================================================
@@ -86,7 +97,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Badminton Video Cutter"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 SOURCE_EXTENSIONS = "동영상 (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.MP4 *.MOV *.AVI *.MKV);;모든 파일 (*)"
 LABELS = ["포핸드 스매시", "오버헤드 클리어", "드롭", "드라이브", "헤어핀", "푸시", "리프트", "서브", "백핸드", "풋워크", "기타"]
 MAX_EXPORT_SEGMENTS = 10000
@@ -472,6 +483,203 @@ class PreviewWorker(QObject):
         self.completed.emit("", self.cancel_event.is_set(), error or "NVENC/CPU 인코딩 실패")
 
 
+# Windows + Python 3.12: 외부 VLC 설치 버전에 맞는 libvlc.dll 검색 지원.
+# os.add_dll_directory() 반환 객체의 수명이 DLL 의존성 로드에 영향을 줄 수 있어 유지.
+VLC_DLL_HANDLES = []
+
+
+def get_vlc_engine():
+    """VLC 라이브러리를 연결해 (모듈, Instance, 진단 문자열)을 반환."""
+    if os.name != "nt":
+        return None, None, "V1.2 VLC 직접 재생은 Windows 환경에서 지원합니다."
+    folders = []
+    custom = os.environ.get("PYTHON_VLC_LIB_PATH", "").strip()
+    if custom:
+        folders.append(Path(custom).parent)
+    for key in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        value = os.environ.get(key)
+        if value:
+            folders.append(Path(value) / "VideoLAN" / "VLC")
+    folders.append(Path(r"C:\Program Files\VideoLAN\VLC"))
+    folders.append(Path(r"C:\Program Files (x86)\VideoLAN\VLC"))
+    for folder in folders:
+        dll = folder / "libvlc.dll"
+        if dll.is_file():
+            os.environ.setdefault("PYTHON_VLC_LIB_PATH", str(dll))
+            if (folder / "plugins").is_dir():
+                os.environ.setdefault("VLC_PLUGIN_PATH", str(folder / "plugins"))
+            os.environ["PATH"] = str(folder) + os.pathsep + os.environ.get("PATH", "")
+            try:
+                VLC_DLL_HANDLES.append(os.add_dll_directory(str(folder)))
+            except (OSError, AttributeError):
+                pass
+            break
+    try:
+        import vlc  # python-vlc는 VLC 본체가 아니라 VLC 64bit의 Python 바인딩.
+        instance = vlc.Instance("--avcodec-hw=none", "--no-video-title-show", "--quiet")
+        if not instance:
+            raise RuntimeError("libVLC 인스턴스를 생성하지 못했습니다.")
+        version = str(vlc.libvlc_get_version())
+        return vlc, instance, f"VLC 직접 재생 준비 완료: {version}"
+    except Exception as exc:
+        return None, None, f"VLC 직접 재생 비활성: {type(exc).__name__}: {exc}"
+
+
+class VLCPlayer(QObject):
+    """기존 QMediaPlayer 인터페이스와 신호를 유지하는 VLC 재생 어댑터.
+
+    libVLC 시간 탐색은 디코더/GOP에 따라 근사이며, 실제 컷은 FFmpeg 원본 기준.
+    libVLC의 상태를 Qt 메인 스레드 QTimer에서 조회하므로 GUI 스레드 안전성을 보존.
+    """
+    positionChanged = Signal(int)
+    durationChanged = Signal(int)
+    playbackStateChanged = Signal(object)
+    errorOccurred = Signal(object, str)
+
+    def __init__(self, module, instance, parent=None):
+        super().__init__(parent)
+        self._vlc = module
+        self._instance = instance
+        self._player = instance.media_player_new()
+        self._video_widget = None
+        self._media = None
+        self._duration = -1
+        self._position = 0
+        self._state = QMediaPlayer.PlaybackState.StoppedState
+        self._reported_error = False
+        self._priming = False
+        self._queued_seek = 0
+        self._source_path = ""
+        self._timer = QTimer(self)
+        self._timer.setInterval(80)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start()
+        self._player.audio_set_volume(70)
+
+    def setVideoOutput(self, widget):
+        self._video_widget = widget
+        # VLC 3.x의 Window Handle은 GUI가 만든 자식 QWidget에 연결한다.
+        widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        widget.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        self._attach_hwnd()
+
+    def _attach_hwnd(self):
+        if self._video_widget is not None:
+            self._player.set_hwnd(int(self._video_widget.winId()))
+
+    def setSource(self, url):
+        self.stop()
+        self._source_path = url.toLocalFile() if url and not url.isEmpty() else ""
+        self._media = None
+        self._position = 0
+        self._duration = -1
+        self._priming = False
+        self._queued_seek = 0
+        self._reported_error = False
+        if not self._source_path:
+            return
+        self._media = self._instance.media_new_path(self._source_path)
+        self._player.set_media(self._media)
+        self._attach_hwnd()
+        # 재생을 시작하지 않고도 첫 프레임을 보이게 하기 위한 준비 작업.
+        self._priming = True
+        QTimer.singleShot(0, self._prime_frame)
+
+    def _prime_frame(self):
+        if self._priming and self._source_path and self._media:
+            self._player.play()
+
+    def _poll(self):
+        if not self._source_path:
+            return
+        try:
+            state = self._player.get_state()
+            if state == self._vlc.State.Error:
+                if not self._reported_error:
+                    self._reported_error = True
+                    self.errorOccurred.emit(QMediaPlayer.Error.FormatError, "VLC 직접 재생 실패. 호환 미리보기 버튼을 사용할 수 있습니다.")
+                self._priming = False
+            if self._priming and state == self._vlc.State.Playing:
+                target_ms = self._queued_seek
+                self._queued_seek = 0
+                self._player.set_time(target_ms)
+                self._player.set_pause(1)
+                self._priming = False
+            pos = self._player.get_time()
+            if pos >= 0:
+                self._position = pos
+                self.positionChanged.emit(pos)
+            duration = self._player.get_length()
+            if duration > 0 and duration != self._duration:
+                self._duration = duration
+                self.durationChanged.emit(duration)
+            new_state = self.playbackState()
+            if new_state != self._state:
+                self._state = new_state
+                self.playbackStateChanged.emit(new_state)
+        except Exception as exc:
+            if not self._reported_error:
+                self._reported_error = True
+                self.errorOccurred.emit(QMediaPlayer.Error.ResourceError, str(exc))
+
+    def position(self):
+        return self._position
+
+    def setPosition(self, ms):
+        self._position = max(0, int(ms))
+        if self._source_path:
+            if self._priming or self._player.get_state() in (self._vlc.State.NothingSpecial, self._vlc.State.Stopped):
+                self._queued_seek = self._position
+                if not self._priming:
+                    self._priming = True
+                    QTimer.singleShot(0, self._prime_frame)
+            else:
+                self._queued_seek = 0
+                self._player.set_time(self._position)
+        self.positionChanged.emit(self._position)
+
+    def playbackState(self):
+        state = self._player.get_state()
+        if state == self._vlc.State.Playing and not self._priming:
+            return QMediaPlayer.PlaybackState.PlayingState
+        if state == self._vlc.State.Paused or self._priming:
+            return QMediaPlayer.PlaybackState.PausedState
+        return QMediaPlayer.PlaybackState.StoppedState
+
+    def play(self):
+        if self._source_path:
+            self._priming = False
+            self._attach_hwnd()
+            self._player.play()
+            # 소스 로드 직후 탐색 요청을 적용한다.
+            if self._queued_seek > 0:
+                queued = self._queued_seek
+                self._queued_seek = 0
+                QTimer.singleShot(300, lambda: self._seek_after_start(queued))
+
+    def _seek_after_start(self, ms):
+        if self._source_path and self._media and self._player.get_state() != self._vlc.State.Error:
+            self._player.set_time(ms)
+
+    def pause(self):
+        self._priming = False
+        self._player.set_pause(1)
+
+    def stop(self):
+        self._priming = False
+        self._player.stop()
+
+    def setPlaybackRate(self, speed):
+        self._player.set_rate(float(speed))
+
+    def release(self):
+        self._timer.stop()
+        self.stop()
+        self._media = None
+        self._player.release()
+        self._instance.release()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -501,10 +709,24 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1350, 900)
         self.setMinimumSize(950, 650)
-        self.player = QMediaPlayer(self)
-        self.audio = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio)
-        self.audio.setVolume(0.7)
+        self.vlc_module, self.vlc_instance, self.vlc_diagnostic = get_vlc_engine()
+        self.direct_vlc = self.vlc_instance is not None
+        if self.direct_vlc:
+            try:
+                self.player = VLCPlayer(self.vlc_module, self.vlc_instance, self)
+                self.audio = None
+            except Exception as exc:
+                self.vlc_diagnostic = f"VLC 플레이어 생성 실패: {type(exc).__name__}: {exc}"
+                self.direct_vlc = False
+                self.player = QMediaPlayer(self)
+                self.audio = QAudioOutput(self)
+                self.player.setAudioOutput(self.audio)
+                self.audio.setVolume(0.7)
+        else:
+            self.player = QMediaPlayer(self)
+            self.audio = QAudioOutput(self)
+            self.player.setAudioOutput(self.audio)
+            self.audio.setVolume(0.7)
         self._build_ui()
         self._connect_media()
         self._make_actions()
@@ -514,6 +736,8 @@ class MainWindow(QMainWindow):
         self.log(f"FFmpeg 위치: {find_tool('ffmpeg') or '찾지 못함'}")
         self.log(f"FFprobe 위치: {find_tool('ffprobe') or '찾지 못함'}")
         self.log(f"Qt 디코딩 설정: QT_FFMPEG_DECODING_HW_DEVICE_TYPES={os.environ.get('QT_FFMPEG_DECODING_HW_DEVICE_TYPES')!r}")
+        self.log(self.vlc_diagnostic, "info" if self.direct_vlc else "warning")
+        self.log("재생 엔진: VLC 원본 직접 재생 (전체 변환 생략)" if self.direct_vlc else "재생 엔진: Qt / AV1에서는 선택형 호환 미리보기")
 
     def _build_ui(self):
         root = QWidget(self)
@@ -537,7 +761,9 @@ class MainWindow(QMainWindow):
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 6, 0)
-        self.video = QVideoWidget()
+        # VLC는 Windows native HWND 자식 위젯에 직접 출력한다.
+        # Qt 엔진에서는 기존 QVideoWidget을 그대로 사용한다.
+        self.video = QWidget() if self.direct_vlc else QVideoWidget()
         self.video.setMinimumHeight(255)
         self.player.setVideoOutput(self.video)
         ll.addWidget(self.video, 1)
@@ -612,7 +838,7 @@ class MainWindow(QMainWindow):
         self.preview_status.setWordWrap(True)
         pg.addWidget(self.preview_status)
         preview_row = QHBoxLayout()
-        self.preview_btn = QPushButton("호환 미리보기 생성 / 사용")
+        self.preview_btn = QPushButton("호환 미리보기 생성 / 사용 (예비 수단)")
         self.preview_btn.clicked.connect(self.start_preview_conversion)
         self.preview_btn.setEnabled(False)
         self.preview_cancel_btn = QPushButton("변환 취소")
@@ -833,16 +1059,28 @@ class MainWindow(QMainWindow):
         self.timeline.update()
         self._refresh_table()
         self._update_range_label()
-        self._set_media_enabled(self.source_codec != "av1")
+        self._set_media_enabled(self.direct_vlc or self.source_codec != "av1")
         self._set_title()
         self.log(f"동영상 열기: {self.video_path} / FPS={self.fps} / 길이={fmt_ms(self.duration_ms)} / 코덱={self.source_codec}")
-        if self.source_codec == "av1":
-            # AV1 원본을 Qt에 넘기지 않아 GPU 디코딩 에러 무한 반복을 방지한다.
-            self.log("AV1 원본 탐지: Qt 직접 재생 대신 H.264 호환 미리보기를 생성합니다.")
-            self.start_preview_conversion()
+        if self.direct_vlc:
+            self.player.setSource(QUrl.fromLocalFile(str(self.video_path)))
+            self.preview_status.setText("VLC로 원본 즉시 재생 — 전체 변환 필요 없음 / 내보내기는 원본 사용")
+            self.log(f"VLC 원본 직접 재생 준비: {self.video_path} / 전체 미리보기 변환 생략")
+        elif self.source_codec == "av1":
+            # VLC가 없으면 자동 40분 변환 대신, 기존 캐시를 먼저 확인한다.
+            try:
+                cached = proxy_target(self.video_path)
+                if cached.is_file() and cached.stat().st_size > 1024:
+                    self.log(f"기존 H.264 미리보기 캐시 발견: {cached}")
+                    self._use_preview_file(cached)
+                else:
+                    self.preview_status.setText("AV1 재생: VLC 64비트 + python-vlc 설치 권장 / 대체 버튼으로 전체 변환 가능(느림)")
+                    self.log("AV1 원본 탐지: VLC 없음. 자동 전체 변환은 생략합니다. VLC 설치 또는 미리보기 버튼을 선택하세요.", "warning")
+            except OSError as exc:
+                self.log(f"미리보기 캐시 확인 실패: {exc}", "warning")
         else:
             self.player.setSource(QUrl.fromLocalFile(str(self.video_path)))
-            self.preview_status.setText(f"원본 영상 직접 재생 / {self.source_codec.upper()} (검은 화면이면 호환 미리보기를 클릭)")
+            self.preview_status.setText(f"Qt 원본 직접 재생 / {self.source_codec.upper()} (검은 화면이면 호환 미리보기를 클릭)")
         if not find_tool("ffprobe"):
             self.log("FFprobe 미설치: FPS를 알 수 없으므로 프레임 이동이 비활성화됩니다.", "warning")
         return True
@@ -1336,7 +1574,13 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.log("프로그램 종료")
-        self.player.stop()
+        if self.direct_vlc:
+            try:
+                self.player.release()
+            except Exception as exc:
+                LOGGER.warning("VLC 종료 정리 오류: %s", exc)
+        else:
+            self.player.stop()
         event.accept()
 
 

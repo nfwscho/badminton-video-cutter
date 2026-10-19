@@ -1,15 +1,18 @@
-# Badminton Video Cutter v1.0.0
+# Badminton Video Cutter v1.2.0
 
 배드민턴 경기/레슨 원본 동영상에서 여러 스트로크 구간을 잘라 **각각 MP4로 일괄 저장**하고, 이후 AI 자세 분석/데이터셋 정리에 활용할 수 있도록 **JSON·CSV 메타데이터**를 만드는 Windows 데스크톱 프로그램입니다.
 
 - **실행 소스는 `badminton_video_cutter.py` 단 한 개**입니다. 별도 Python 패키지 구조나 Docker를 사용하지 않습니다.
-- 다른 파일은 사용 설명서(`README.md`)와 Git 제외 규칙(`.gitignore`)입니다.
-- 실행 중 `logs/`, 영상 출력 폴더, `.bcut.json` 프로젝트 파일 등이 생길 수 있습니다.
+- 다른 파일은 사용 설명서(`README.md`), 설치 및 Git 순서별 안내서(`INSTALL.md`), Git 제외 규칙(`.gitignore`)입니다.
+- 실행 중 `logs/`, `preview_cache/`, 영상 출력 폴더, `.bcut.json` 프로젝트 파일 등이 생길 수 있습니다.
+- **v1.2 개선 (권장)**: VLC 64비트 + `python-vlc`를 설치하면 **AV1 영상을 원본 상태로 즉시 재생**합니다. 40분 영상을 20분 동안 사전 변환할 필요가 없습니다.  기존 FFmpeg 호환 미리보기(H.264)는 문제가 생길 때의 예비 기능으로 보존합니다.
+- **v1.1 유지**: 필요 시 미리보기를 백그라운드에서 변환하고, NVIDIA NVENC가 실패하면 CPU로 자동 재시도합니다. 원본 컷 내보내기와 JSON/CSV 등은 기존과 동일합니다.
 
 ## 1. 준비 환경
 
 - **Windows 10/11**, **Python 3.12**, PowerShell
-- **PySide6**: 영상 플레이어와 GUI
+- **PySide6**: 프로그램 GUI (VLC가 없으면 Qt 기본 재생 사용)
+- **VLC 64비트 + python-vlc**: AV1 영상 **사전 변환 없는 원본 직접 재생**을 위한 권장 조합
 - **FFmpeg와 FFprobe**: 컷 저장과 영상 FPS/해상도 확인
 - **Git**: 소스 버전 관리
 - Docker 사용 안 함. OpenCV/MediaPipe/AI 모델 설치 **불필요** (V1은 수동 컷 편집)
@@ -27,16 +30,16 @@ New-Item -ItemType Directory -Force "D:\stockproj\badminton-video-cutter"
 Set-Location "D:\stockproj\badminton-video-cutter"
 ```
 
-다운로드한 ZIP(`badminton-video-cutter-v1.zip`) 안의 **3개 파일**을 이 폴더에 압축 해제합니다. 파일을 직접 저장했다면 세 파일을 해당 폴더에 복사하면 됩니다.
+다운로드한 ZIP(`badminton-video-cutter-v1.2.zip`) 안의 **4개 파일**을 이 폴더에 압축 해제합니다. 파일을 직접 저장했다면 네 파일을 해당 폴더에 복사하면 됩니다.
 
 예시: ZIP을 Windows 다운로드 폴더에 저장한 경우
 
 ```powershell
-Expand-Archive -LiteralPath "$env:USERPROFILE\Downloads\badminton-video-cutter-v1.zip" -DestinationPath "D:\stockproj\badminton-video-cutter" -Force
+Expand-Archive -LiteralPath "$env:USERPROFILE\Downloads\badminton-video-cutter-v1.2.zip" -DestinationPath "D:\stockproj\badminton-video-cutter" -Force
 Get-ChildItem -Force
 ```
 
-파일 목록에서 `badminton_video_cutter.py`, `README.md`, `.gitignore`가 보여야 합니다.
+파일 목록에서 `badminton_video_cutter.py`, `README.md`, `INSTALL.md`, `.gitignore`가 보여야 합니다.
 
 ### 2-2. Python 3.12 확인 및 설치
 
@@ -81,7 +84,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install PySide6
+python -m pip install PySide6 python-vlc
 ```
 
 가상환경이 활성화되지 않았다면:
@@ -90,6 +93,31 @@ python -m pip install PySide6
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install PySide6
 ```
+
+### 2-5. VLC 재생 엔진 설치 (AV1 영상 권장)
+
+Windows PowerShell에서 VLC 64비트를 설치합니다 (이미 설치했다면 생략).
+
+```powershell
+winget install --id VideoLAN.VLC -e
+```
+
+또는 [VLC 공식 Windows 다운로드](https://www.videolan.org/vlc/download-windows.html)에서 **64비트**를 설치하세요. 설치 후 새 PowerShell을 열어 아래 명령을 실행합니다.
+
+```powershell
+cd D:\stockproj\badminton-video-cutter
+.\.venv\Scripts\python.exe -m pip install python-vlc
+Test-Path "C:\Program Files\VideoLAN\VLC\libvlc.dll"
+```
+
+`True`이면 일반적인 위치에 VLC 라이브러리가 있습니다. `False`이면 VLC 설치 폴더를 확인하세요. 다른 곳에 설치했다면 이 세션에서 다음을 설정할 수 있습니다.
+
+```powershell
+$env:PYTHON_VLC_LIB_PATH = "D:\VLC\libvlc.dll"   # 예시: 실제 경로로 변경
+$env:VLC_PLUGIN_PATH = "D:\VLC\plugins"        # 예시: 실제 경로로 변경
+```
+
+V1.2는 시작 시 VLC 라이브러리를 검사해 가능한 경우 원본을 재생합니다. Qt 검은 화면 오류를 반복하지 않고 **재생 직후 바로 IN/OUT 작업이 가능합니다.** VLC에서도 CPU AV1 디코딩 성능이 모자라면 끊김이 발생할 수 있습니다.
 
 ### 2-5. FFmpeg 설치
 
@@ -119,7 +147,7 @@ Set-Location "D:\stockproj\badminton-video-cutter"
 
 ## 3. 사용 순서
 
-1. **동영상 열기** 버튼을 눌러 원본 MP4 등을 불러옵니다.
+1. **동영상 열기** 버튼을 눌러 원본 MP4 등을 불러옵니다. **AV1 영상이라면** 먼저 "영상 재생 호환성" 영역에 미리보기 변환 진행률이 표시됩니다. 완료되면 정상 재생할 수 있습니다. (긴 40분 영상은 몇 분~수십 분 이상 소요될 수 있습니다.)
 2. 재생/일시정지, 슬라이더 또는 좌우 방향키를 이용해 첫 구간으로 이동합니다.
 3. `I` 키로 **IN(시작)** 지정, `O` 키로 **OUT(끝)** 지정합니다.
 4. `스트로크 종류`를 선택하고 필요한 경우 `메모`를 입력합니다.
@@ -130,6 +158,14 @@ Set-Location "D:\stockproj\badminton-video-cutter"
 9. 컷을 나중에 다시 편집하려면 **프로젝트 저장**을 사용합니다. `.bcut.json`은 컷 시점과 메모를 저장하지만 영상 자체를 포함하지 않습니다.
 
 영상 재생 중 원하는 위치에서 `I`, `O`를 누를 수 있습니다. 리스트에서 **스트로크 종류**, **메모**를 더블클릭하면 셀을 수정할 수 있습니다. **반복 재생**을 체크하면 목록에서 선택한 컷(선택된 컷이 없으면 IN/OUT 구간)을 반복합니다.
+
+### AV1 / 검은 화면 복구 기능 (v1.2)
+
+1. **VLC 64비트 + python-vlc가 설치된 경우**: AV1 원본 영상을 바로 재생합니다. **40분 전체 미리보기 변환이 자동 시작되지 않습니다.** 로그에 `재생 엔진: VLC 원본 직접 재생 (전체 변환 생략)`이 표시됩니다.
+2. **VLC가 없는 경우**: 기존에 생성된 `preview_cache/`의 H.264 미리보기를 찾아 재사용합니다. 캐시가 없으면 원본 AV1을 Qt로 열지 않고, 대체 방법 설치 안내를 표시합니다. **자동 전체 변환은 시작하지 않습니다.**
+3. **VLC에서 재생 문제가 발생한 경우**: 기존의 `호환 미리보기 생성 / 사용 (예비 수단)` 버튼을 눌러 FFmpeg 변환 기능을 수동으로 실행할 수 있습니다. 전체 변환은 긴 영상의 경우 오래 걸립니다.
+4. **모든 경우**: 컷 추출·메타데이터는 재생용 영상이 아닌 **원본 동영상** 기준입니다. 속도 조절/IN/OUT/로그/프로젝트 저장 등의 기존 기능은 유지됩니다.
+5. VLC 환경에서 첫 프레임 표시와 임의 위치 탐색에는 몇 초가 걸릴 수 있습니다. VLC는 프레임 정확성까지 보장하지 않으며 정밀 컷 결과는 재생·검증하세요.
 
 ## 4. 단축키
 
@@ -165,9 +201,11 @@ Set-Location "D:\stockproj\badminton-video-cutter"
 D:\stockproj\badminton-video-cutter\
 ├─ badminton_video_cutter.py    # 유일한 Python 소스
 ├─ README.md
+├─ INSTALL.md
 ├─ .gitignore
 ├─ .venv\                      # 가상환경 (Git 제외)
-└─ logs\                       # 실행 로그 (Git 제외)
+├─ logs\                       # 실행 로그 (Git 제외)
+└─ preview_cache\              # AV1 호환 미리보기 캐시 (Git 제외)
 
 D:\video\lesson_clips\
 ├─ lesson_001_포핸드_스매시.mp4
@@ -212,7 +250,7 @@ git config --global user.email "YOUR_EMAIL@example.com"
 
 ```powershell
 git status
-git add .gitignore README.md badminton_video_cutter.py
+git add .gitignore README.md INSTALL.md badminton_video_cutter.py
 git diff --cached --stat
 git commit -m "Initial commit: badminton video cutter v1"
 git log --oneline -5
@@ -225,7 +263,7 @@ git log --oneline -5
 ```powershell
 git status
 git diff
-git add badminton_video_cutter.py README.md .gitignore
+git add badminton_video_cutter.py README.md INSTALL.md .gitignore
 git commit -m "Describe changes"
 ```
 
@@ -242,7 +280,7 @@ git push -u origin main
 
 - `No module named 'PySide6'`: 가상환경의 Python으로 실행했는지 확인하고 `.\.venv\Scripts\python.exe -m pip install PySide6` 실행.
 - `ffmpeg` / `ffprobe` 명령을 찾지 못함: 설치 경로와 `PATH` 확인, 또는 `.exe` 파일을 Python 소스 옆에 두기.
-- 동영상이 검게 나오거나 소리/영상 재생 불가: 파일 코덱과 Qt Multimedia/Windows 디코더 호환 여부 확인. 다른 MP4(H.264/AAC)로 시험.
+- AV1 영상이 검게 나오거나 재생되지 않음: 프로그램이 v1.2.0인지 확인하고 `VLC 직접 재생 준비 완료` 로그를 확인하세요. VLC 및 `python-vlc`가 설치되어 있어야 변환 없이 재생합니다. 직접 재생이 실패하면 기존 호환 미리보기 버튼을 사용하세요.
 - 프레임 이동 버튼 비활성화: `ffprobe` 실행파일이 없거나 FPS를 확인하지 못한 경우.
 - `Git`에서 사용자 정보 설정 요청: `git config --global user.name`, `git config --global user.email` 설정.
 - 편집/내보내기 문제: `logs/badminton_video_cutter.log`와 화면 하단 로그 확인.
