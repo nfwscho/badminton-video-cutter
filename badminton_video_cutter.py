@@ -28,6 +28,22 @@
 #     N(컷 추가), Delete(선택 컷 삭제), 좌/우 방향키(프레임 근사 이동).
 # 19. 작업 중 소스/프로젝트 변경 방지, 종료 전 변경 사항 확인.
 # 20. 프로젝트와 로그는 별도 생성 데이터이며 소스 파일은 이 1개뿐.
+# 21. FFprobe에서 원본 영상 코덱(AV1/H.264 등) 확인 및 UI/로그 표시.
+# 22. AV1은 Qt 재생 오류를 피하도록 원본을 곧바로 열지 않고
+#     FFmpeg로 H.264/AAC 호환 미리보기(proxy)를 자동 생성해 재생.
+# 23. 비AV1 영상도 재생 오류 발생 시 "호환 미리보기 생성" 수동 전환 지원.
+# 24. 40분 이상 긴 영상도 QThread에서 호환 미리보기 생성; 진행률·취소 지원.
+# 25. RTX 그래픽카드를 위한 NVENC 인코딩 우선 시도, 실패하면 libx264
+#     CPU 인코딩으로 자동 재시도(FFmpeg 빌드/드라이버 호환성 대비).
+# 26. 미리보기 최대 1280px 가로/30fps로 변환해 디코딩/저장 부담 감소.
+# 27. 원본 경로·파일 크기·수정시각 SHA256 캐시 키로 호환 미리보기 재사용.
+# 28. 미리보기는 preview_cache/ 별도 저장, .gitignore로 Git에서 제외;
+#     중간 실패·취소 시 .part.mp4 삭제, 원본 동영상은 절대 변경하지 않음.
+# 29. IN/OUT, 구간 반복, JSON/CSV 메타데이터, 컷 내보내기는 항상
+#     FFprobe로 읽은 원본 시간축과 원본 동영상을 기준으로 수행.
+# 30. Qt 하드웨어 디코딩 환경 설정은 PySide6 import 이전에 적용.
+# 31. 미리보기 생성 중 원본 변경·프로젝트 로드·내보내기·종료를 제한,
+#     취소 후 스레드/임시파일을 정리. 기존 기능/단축키/로그를 유지.
 #
 # 필요 패키지: pip install PySide6
 # 필요 외부 실행파일: ffmpeg, ffprobe (PATH 또는 이 파일과 같은 폴더)
@@ -37,6 +53,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from fractions import Fraction
@@ -50,7 +67,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from typing import Optional
+
+# Windows/Qt에서 AV1 하드웨어 디코더 초기화 오류 반복을 줄이기 위한 설정.
+# AV1 재생은 아래 환경변수만 믿지 않고 H.264 미리보기 변환으로 우회한다.
+os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", ",")
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen, QShortcut, QKeySequence
@@ -64,7 +86,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Badminton Video Cutter"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 SOURCE_EXTENSIONS = "동영상 (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.MP4 *.MOV *.AVI *.MKV);;모든 파일 (*)"
 LABELS = ["포핸드 스매시", "오버헤드 클리어", "드롭", "드라이브", "헤어핀", "푸시", "리프트", "서브", "백핸드", "풋워크", "기타"]
 MAX_EXPORT_SEGMENTS = 10000
@@ -134,7 +156,7 @@ def probe_video(path: Path) -> dict:
     if not tool:
         return {}
     cmd = [tool, "-v", "error", "-select_streams", "v:0",
-           "-show_entries", "stream=avg_frame_rate,width,height:format=duration",
+           "-show_entries", "stream=avg_frame_rate,width,height,codec_name:format=duration",
            "-of", "json", str(path)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -146,6 +168,7 @@ def probe_video(path: Path) -> dict:
         data = json.loads(proc.stdout)
         stream = (data.get("streams") or [{}])[0]
         result = {
+            "codec": str(stream.get("codec_name") or "unknown").lower(),
             "width": int(stream.get("width") or 0),
             "height": int(stream.get("height") or 0),
             "duration_ms": int(float(data.get("format", {}).get("duration") or 0) * 1000),
@@ -347,6 +370,108 @@ class ExportWorker(QObject):
         self.completed.emit(successes, failure_count, self.cancel_event.is_set(), manifest_file)
 
 
+def proxy_target(source: Path) -> Path:
+    """파일이 바뀌었을 때만 미리보기 캐시를 갱신하기 위한 고유 키."""
+    info = source.stat()
+    identity = f"{os.path.normcase(str(source.resolve()))}\n{info.st_size}\n{info.st_mtime_ns}\nproxy-v1-1280-30fps"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    return app_dir() / "preview_cache" / f"{sanitize_name(source.stem)[:40]}_{digest}.mp4"
+
+
+class PreviewWorker(QObject):
+    """GUI를 멈추지 않게 FFmpeg를 백그라운드에서 실행하는 미리보기 변환 작업."""
+    progress = Signal(int, str)
+    message = Signal(str)
+    completed = Signal(str, bool, str)  # path, cancelled, error
+
+    def __init__(self, ffmpeg: str, source: Path, dest: Path, duration_ms: int,
+                 cancel_event: threading.Event):
+        super().__init__()
+        self.ffmpeg = ffmpeg
+        self.source = source
+        self.dest = dest
+        self.duration_ms = duration_ms
+        self.cancel_event = cancel_event
+
+    def run(self):
+        error = ""
+        try:
+            self.dest.parent.mkdir(parents=True, exist_ok=True)
+            # 1차 GPU 인코딩(NVIDIA NVENC), 2차 CPU 인코딩(libx264).
+            # 원본 AV1 디코딩은 FFmpeg 기본 소프트웨어 디코더를 사용한다.
+            for codec_name, encode_opts in [
+                ("NVENC GPU", ["-c:v", "h264_nvenc", "-preset", "fast", "-cq", "28", "-b:v", "0"]),
+                ("libx264 CPU", ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "27"]),
+            ]:
+                if self.cancel_event.is_set():
+                    break
+                tmp = self.dest.with_name(self.dest.stem + f".{os.getpid()}.{int(time.time_ns())}.part.mp4")
+                self.message.emit(f"미리보기 변환 시작: {codec_name} / {self.source.name}")
+                # AV1의 GPU 가속 디코딩은 명시적으로 꺼서, RTX 20xx AV1 문제를 피한다.
+                cmd = [self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
+                       "-progress", "pipe:1", "-stats_period", "0.5", "-hwaccel", "none",
+                       "-i", str(self.source), "-map", "0:v:0", "-map", "0:a:0?",
+                       "-vf", "fps=30,scale=w='min(1280,iw)':h=-2",
+                       *encode_opts, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
+                       "-sn", "-dn", "-map_metadata", "-1", "-movflags", "+faststart", str(tmp)]
+                proc = None
+                try:
+                    # stderr를 별도 임시 파일로 받으면 pipe 버퍼 정체가 발생하지 않는다.
+                    import tempfile
+                    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as err_file:
+                        proc = subprocess.Popen(
+                            cmd, stdout=subprocess.PIPE, stderr=err_file, text=True,
+                            encoding="utf-8", errors="replace",
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        assert proc.stdout is not None
+                        for line in proc.stdout:
+                            if self.cancel_event.is_set():
+                                proc.terminate()
+                                break
+                            if line.startswith("out_time_us="):
+                                try:
+                                    encoded_ms = max(0, int(line.split("=", 1)[1]) // 1000)
+                                    pct = min(99, int(encoded_ms * 100 / max(1, self.duration_ms)))
+                                    self.progress.emit(pct, f"{codec_name} / {fmt_ms(encoded_ms)}")
+                                except ValueError:
+                                    pass
+                        proc.stdout.close()
+                        try:
+                            proc.wait(timeout=8 if self.cancel_event.is_set() else 120)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
+                        err_file.seek(0)
+                        error = err_file.read().strip()[-1600:]
+                    if not self.cancel_event.is_set() and proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+                        os.replace(tmp, self.dest)
+                        self.progress.emit(100, "호환 미리보기 준비 완료")
+                        self.message.emit(f"미리보기 생성 완료 ({codec_name}): {self.dest}")
+                        self.completed.emit(str(self.dest), False, "")
+                        return
+                    if self.cancel_event.is_set():
+                        self.message.emit("호환 미리보기 생성 취소")
+                        break
+                    self.message.emit(f"{codec_name} 변환 실패: {error or f'FFmpeg 반환코드 {proc.returncode}'}")
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    self.message.emit(f"{codec_name} 변환 실행 오류: {error}")
+                finally:
+                    if proc and proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError as exc:
+                        self.message.emit(f"미리보기 임시파일 정리 실패: {exc}")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.message.emit(f"미리보기 생성 실패: {error}")
+            LOGGER.exception("미리보기 변환 예외")
+        self.completed.emit("", self.cancel_event.is_set(), error or "NVENC/CPU 인코딩 실패")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -365,6 +490,14 @@ class MainWindow(QMainWindow):
         self.worker: Optional[ExportWorker] = None
         self.cancel_event: Optional[threading.Event] = None
         self.export_active = False
+        self.source_codec = "unknown"
+        self.source_duration_ms = 0
+        self.preview_path: Optional[Path] = None
+        self.using_proxy = False
+        self.preview_active = False
+        self.preview_thread: Optional[QThread] = None
+        self.preview_worker: Optional[PreviewWorker] = None
+        self.preview_cancel_event: Optional[threading.Event] = None
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1350, 900)
         self.setMinimumSize(950, 650)
@@ -380,6 +513,7 @@ class MainWindow(QMainWindow):
         self.log(f"프로그램 시작: v{APP_VERSION}")
         self.log(f"FFmpeg 위치: {find_tool('ffmpeg') or '찾지 못함'}")
         self.log(f"FFprobe 위치: {find_tool('ffprobe') or '찾지 못함'}")
+        self.log(f"Qt 디코딩 설정: QT_FFMPEG_DECODING_HW_DEVICE_TYPES={os.environ.get('QT_FFMPEG_DECODING_HW_DEVICE_TYPES')!r}")
 
     def _build_ui(self):
         root = QWidget(self)
@@ -471,6 +605,27 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.delete_btn)
         mg.addLayout(row2)
         rl.addWidget(mark_group)
+
+        preview_group = QGroupBox("영상 재생 호환성 (AV1 지원)")
+        pg = QVBoxLayout(preview_group)
+        self.preview_status = QLabel("영상 열기 후 코덱을 확인합니다.")
+        self.preview_status.setWordWrap(True)
+        pg.addWidget(self.preview_status)
+        preview_row = QHBoxLayout()
+        self.preview_btn = QPushButton("호환 미리보기 생성 / 사용")
+        self.preview_btn.clicked.connect(self.start_preview_conversion)
+        self.preview_btn.setEnabled(False)
+        self.preview_cancel_btn = QPushButton("변환 취소")
+        self.preview_cancel_btn.clicked.connect(self.cancel_preview_conversion)
+        self.preview_cancel_btn.setEnabled(False)
+        preview_row.addWidget(self.preview_btn, 1)
+        preview_row.addWidget(self.preview_cancel_btn)
+        pg.addLayout(preview_row)
+        self.preview_progress = QProgressBar()
+        self.preview_progress.setRange(0, 100)
+        self.preview_progress.setValue(0)
+        pg.addWidget(self.preview_progress)
+        rl.addWidget(preview_group)
 
         out_group = QGroupBox("내보내기")
         og = QVBoxLayout(out_group)
@@ -602,14 +757,18 @@ class MainWindow(QMainWindow):
         self._update_segment_controls()
 
     def _update_segment_controls(self):
-        self.delete_btn.setEnabled(bool(self.segments) and not self.export_active)
-        self.clear_btn.setEnabled(bool(self.segments) and not self.export_active)
-        self.export_btn.setEnabled(bool(self.segments) and not self.export_active)
-        self.project_btn.setEnabled(not self.export_active)
+        busy = self.export_active or self.preview_active
+        self.delete_btn.setEnabled(bool(self.segments) and not busy)
+        self.clear_btn.setEnabled(bool(self.segments) and not busy)
+        self.export_btn.setEnabled(bool(self.segments) and not busy)
+        self.project_btn.setEnabled(not busy)
 
     def _guard_export(self) -> bool:
         if self.export_active:
             QMessageBox.warning(self, "작업 중", "내보내기가 진행 중입니다. 완료 또는 취소 후 진행하세요.")
+            return False
+        if self.preview_active:
+            QMessageBox.warning(self, "미리보기 생성 중", "호환 미리보기 생성이 진행 중입니다. 완료 또는 취소 후 진행하세요.")
             return False
         return True
 
@@ -633,7 +792,10 @@ class MainWindow(QMainWindow):
         if not path.is_file():
             QMessageBox.critical(self, "파일 없음", f"동영상 파일을 찾을 수 없습니다.\n{path}")
             return False
-        self.player.pause()
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.using_proxy = False
+        self.preview_path = None
         self.video_path = path.resolve()
         if reset:
             self.segments = []
@@ -644,18 +806,26 @@ class MainWindow(QMainWindow):
             self.dirty = False
         info = probe_video(self.video_path)
         self.fps = info.get("fps")
+        self.source_codec = info.get("codec", "unknown")
         self.duration_ms = info.get("duration_ms", 0)
+        self.source_duration_ms = self.duration_ms
         self.video_info.setText(
             f"FPS: {self.fps:.3f}" if self.fps else "FPS: 확인 불가"
         )
         width, height = info.get("width", 0), info.get("height", 0)
         if width and height:
             self.video_info.setText(self.video_info.text() + f"    해상도: {width}×{height}")
+        self.video_info.setText(self.video_info.text() + f"    코덱: {self.source_codec.upper()}")
         self.filename_label.setText(self.video_path.name)
         self.filename_label.setToolTip(str(self.video_path))
         self.output_edit.setText(str(self.video_path.parent / (self.video_path.stem + "_clips")))
-        self.player.setSource(QUrl.fromLocalFile(str(self.video_path)))
+        self.preview_status.setText(f"원본 코덱: {self.source_codec.upper()} / 재생 방식 확인 중")
+        self.preview_progress.setValue(0)
+        self.preview_btn.setEnabled(bool(find_tool("ffmpeg")))
         self.seek.setMaximum(self.duration_ms)
+        self.seek.setValue(0)
+        self.time_label.setText(f"{fmt_ms(0)} / {fmt_ms(self.duration_ms)}")
+        self.timeline.position_ms = 0
         self.timeline.duration_ms = self.duration_ms
         self.timeline.in_ms = self.in_ms
         self.timeline.out_ms = self.out_ms
@@ -663,16 +833,23 @@ class MainWindow(QMainWindow):
         self.timeline.update()
         self._refresh_table()
         self._update_range_label()
-        self._set_media_enabled(True)
+        self._set_media_enabled(self.source_codec != "av1")
         self._set_title()
-        self.log(f"동영상 열기: {self.video_path} / FPS={self.fps} / 길이={fmt_ms(self.duration_ms)}")
+        self.log(f"동영상 열기: {self.video_path} / FPS={self.fps} / 길이={fmt_ms(self.duration_ms)} / 코덱={self.source_codec}")
+        if self.source_codec == "av1":
+            # AV1 원본을 Qt에 넘기지 않아 GPU 디코딩 에러 무한 반복을 방지한다.
+            self.log("AV1 원본 탐지: Qt 직접 재생 대신 H.264 호환 미리보기를 생성합니다.")
+            self.start_preview_conversion()
+        else:
+            self.player.setSource(QUrl.fromLocalFile(str(self.video_path)))
+            self.preview_status.setText(f"원본 영상 직접 재생 / {self.source_codec.upper()} (검은 화면이면 호환 미리보기를 클릭)")
         if not find_tool("ffprobe"):
             self.log("FFprobe 미설치: FPS를 알 수 없으므로 프레임 이동이 비활성화됩니다.", "warning")
         return True
 
     def on_duration_changed(self, duration: int):
-        # Qt가 조회한 길이는 FFprobe 길이가 없는 경우 또는 실제 표시 길이 보정에 사용한다.
-        if duration > 0:
+        # 미리보기 인코딩 프레임레이트 차이가 원본의 컷 구간 시간축을 바꾸지 않도록 한다.
+        if duration > 0 and not (self.using_proxy and self.source_duration_ms > 0):
             self.duration_ms = duration
             self.seek.setMaximum(duration)
             self.timeline.duration_ms = duration
@@ -715,6 +892,98 @@ class MainWindow(QMainWindow):
     def _on_media_error(self, error, error_string):
         if error != QMediaPlayer.Error.NoError:
             self.log(f"동영상 재생 오류: {error_string}", "error")
+            if self.video_path and not self.using_proxy and not self.preview_active:
+                self.preview_status.setText("직접 재생에 실패했습니다. '호환 미리보기 생성 / 사용'을 누르세요.")
+                self.preview_btn.setEnabled(bool(find_tool("ffmpeg")))
+
+    def start_preview_conversion(self):
+        if not self.video_path or self.preview_active or self.export_active:
+            return
+        ffmpeg = find_tool("ffmpeg")
+        if not ffmpeg:
+            self.log("호환 미리보기 생성 실패: FFmpeg 설치가 필요합니다.", "error")
+            QMessageBox.warning(self, "FFmpeg 필요", "호환 미리보기를 생성하려면 FFmpeg가 필요합니다.")
+            return
+        try:
+            target = proxy_target(self.video_path)
+        except OSError as exc:
+            self.log(f"미리보기 캐시 경로 확인 실패: {exc}", "error")
+            return
+        if target.is_file() and target.stat().st_size > 1024:
+            self.log(f"기존 호환 미리보기 재사용: {target}")
+            self._use_preview_file(target)
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        self.player.setSource(QUrl())
+        self._set_media_enabled(False)
+        self.preview_active = True
+        self.preview_cancel_event = threading.Event()
+        self.preview_thread = QThread(self)
+        self.preview_worker = PreviewWorker(ffmpeg, self.video_path, target,
+                                            self.source_duration_ms, self.preview_cancel_event)
+        self.preview_worker.moveToThread(self.preview_thread)
+        self.preview_thread.started.connect(self.preview_worker.run)
+        self.preview_worker.progress.connect(self._on_preview_progress)
+        self.preview_worker.message.connect(self.log)
+        self.preview_worker.completed.connect(self._on_preview_completed)
+        self.preview_worker.completed.connect(self.preview_thread.quit)
+        self.preview_thread.finished.connect(self.preview_worker.deleteLater)
+        self.preview_thread.finished.connect(self.preview_thread.deleteLater)
+        self.preview_thread.finished.connect(self._preview_thread_finished)
+        self.preview_btn.setEnabled(False)
+        self.preview_cancel_btn.setEnabled(True)
+        self.preview_progress.setValue(0)
+        self.preview_status.setText("H.264 호환 미리보기 생성 중… 원본은 변경되지 않습니다.")
+        for widget in (self.open_btn, self.folder_btn, self.mode_combo, self.output_edit, self.cut_table):
+            widget.setEnabled(False)
+        self._update_segment_controls()
+        self.log(f"미리보기 생성 요청: {self.video_path} -> {target}")
+        self.preview_thread.start()
+
+    def _on_preview_progress(self, pct: int, description: str):
+        self.preview_progress.setValue(max(0, min(100, pct)))
+        self.preview_status.setText(f"호환 미리보기 생성 중 {pct}% — {description}")
+
+    def cancel_preview_conversion(self):
+        if self.preview_active and self.preview_cancel_event:
+            self.preview_cancel_event.set()
+            self.preview_cancel_btn.setEnabled(False)
+            self.log("호환 미리보기 생성 취소 요청", "warning")
+
+    def _on_preview_completed(self, path: str, cancelled: bool, error: str):
+        if path and not cancelled:
+            self._use_preview_file(Path(path))
+        else:
+            self.preview_status.setText("미리보기 생성 취소됨" if cancelled else "미리보기 생성 실패 (로그를 확인하세요)")
+            self.log("호환 미리보기 생성 취소" if cancelled else f"호환 미리보기 생성 실패: {error}",
+                     "warning" if cancelled else "error")
+            if not cancelled:
+                QMessageBox.warning(self, "호환 미리보기 생성 실패", "FFmpeg 변환이 실패했습니다. 작업 로그를 확인하세요.\n" + error[-600:])
+            # AV1인 경우 원본 Qt 재생 시도는 오류 반복이므로 중지한 채로 둔다.
+            if self.source_codec != "av1":
+                self.player.setSource(QUrl.fromLocalFile(str(self.video_path)))
+                self._set_media_enabled(True)
+
+    def _use_preview_file(self, path: Path):
+        self.preview_path = path
+        self.using_proxy = True
+        self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.preview_progress.setValue(100)
+        self.preview_status.setText("H.264 호환 미리보기로 재생 중 (내보내기는 원본 사용)")
+        self._set_media_enabled(True)
+        self.log(f"재생 소스 전환: 호환 미리보기={path} / 컷 내보내기 원본={self.video_path}")
+
+    def _preview_thread_finished(self):
+        self.preview_active = False
+        self.preview_thread = None
+        self.preview_worker = None
+        self.preview_cancel_event = None
+        self.preview_cancel_btn.setEnabled(False)
+        self.preview_btn.setEnabled(bool(self.video_path and find_tool("ffmpeg")))
+        for widget in (self.open_btn, self.folder_btn, self.mode_combo, self.output_edit, self.cut_table):
+            widget.setEnabled(True)
+        self._update_segment_controls()
 
     def _seek_pressed(self):
         self.is_dragging = True
@@ -818,7 +1087,7 @@ class MainWindow(QMainWindow):
         self._update_segment_controls()
 
     def on_table_item_changed(self, item):
-        if self.is_reloading_table or self.export_active:
+        if self.is_reloading_table or self.export_active or self.preview_active:
             return
         row = item.row()
         if not 0 <= row < len(self.segments):
@@ -842,7 +1111,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"컷 #{seg.number} 선택: {seg.label}", 5000)
 
     def delete_selected(self):
-        if self.export_active:
+        if self.export_active or self.preview_active:
             return
         row = self.cut_table.currentRow()
         if not 0 <= row < len(self.segments):
@@ -853,7 +1122,7 @@ class MainWindow(QMainWindow):
         self.log(f"컷 삭제 #{seg.number}: {seg.label}")
 
     def clear_segments(self):
-        if not self.segments or self.export_active:
+        if not self.segments or self.export_active or self.preview_active:
             return
         if QMessageBox.question(self, "전체 삭제", "등록한 모든 컷을 삭제할까요?",
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -976,7 +1245,7 @@ class MainWindow(QMainWindow):
         self.log(f"프로젝트 불러오기: {path} / 컷 {len(segments)}개")
 
     def export_clips(self):
-        if self.export_active or not self.video_path or not self.segments:
+        if self.export_active or self.preview_active or not self.video_path or not self.segments:
             return
         ffmpeg = find_tool("ffmpeg")
         if not ffmpeg:
@@ -1055,6 +1324,10 @@ class MainWindow(QMainWindow):
         self._update_segment_controls()
 
     def closeEvent(self, event):
+        if self.preview_active:
+            QMessageBox.warning(self, "미리보기 생성 중", "호환 미리보기 작업을 취소하거나 완료한 뒤 종료하세요.")
+            event.ignore()
+            return
         if self.export_active:
             QMessageBox.warning(self, "내보내기 진행 중", "작업 취소 또는 완료 후 종료하세요.")
             event.ignore()
